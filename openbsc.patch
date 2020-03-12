@@ -1,0 +1,874 @@
+--- stuff/gsm_04_08.c	2020-02-28 21:04:30.152718044 +0100
++++ openbsc/openbsc/src/libmsc/gsm_04_08.c	2020-03-02 03:33:51.607047820 +0100
+@@ -42,6 +42,7 @@
+ #include <openbsc/gsm_04_11.h>
+ #include <openbsc/gsm_04_08.h>
+ #include <openbsc/gsm_04_80.h>
++#include <openbsc/gsm_04_14.h>
+ #include <openbsc/abis_rsl.h>
+ #include <openbsc/chan_alloc.h>
+ #include <openbsc/paging.h>
+@@ -65,11 +66,13 @@
+ #include <osmocom/gsm/protocol/gsm_04_08.h>
+ #include <osmocom/core/msgb.h>
+ #include <osmocom/core/talloc.h>
++#include <osmocom/core/utils.h>
+ #include <osmocom/gsm/tlv.h>
++
+ #include <assert.h>
+-#include "hex.h"
+ #include "server.h"
+-
++#include "hex.h"
++#include "client.h"
+ void *tall_locop_ctx;
+ void *tall_authciphop_ctx;
+ 
+@@ -81,12 +84,6 @@
+ static void schedule_reject(struct gsm_subscriber_connection *conn);
+ static void release_anchor(struct gsm_subscriber_connection *conn);
+ 
+-struct gsm_lai {
+-	uint16_t mcc;
+-	uint16_t mnc;
+-	uint16_t lac;
+-};
+-
+ static int apply_codec_restrictions(struct gsm_bts *bts,
+ 	struct gsm_mncc_bearer_cap *bcap)
+ {
+@@ -236,9 +233,10 @@
+ 		/* FIXME: Should start a timer for completion ... */
+ 
+ 	/* Then do whatever is needed ... */
+-	if (rc == AUTH_DO_AUTH_THEN_CIPH){
+-		/* Start authentication*/
+-                 return gsm48_tx_mm_auth_req(conn, op->atuple.vec.rand, op->atuple.key_seq);
++	if (rc == AUTH_DO_AUTH_THEN_CIPH) {
++		/* Start authentication */
++		return gsm48_tx_mm_auth_req(conn, op->atuple.vec.rand, NULL,
++					    op->atuple.key_seq);
+ 	} else if (rc == AUTH_DO_CIPH) {
+ 		/* Start ciphering directly */
+ 		return gsm0808_cipher_mode(conn, net->a5_encryption,
+@@ -294,7 +292,7 @@
+ 	}
+ }
+ 
+-static void release_loc_updating_req(struct gsm_subscriber_connection *conn, int release)
++static void _release_loc_updating_req(struct gsm_subscriber_connection *conn, int release)
+ {
+ 	if (!conn->loc_operation)
+ 		return;
+@@ -309,11 +307,31 @@
+ 		msc_release_connection(conn);
+ }
+ 
++static void loc_updating_failure(struct gsm_subscriber_connection *conn, int release)
++{
++	if (!conn->loc_operation)
++		return;
++	LOGP(DMM, LOGL_ERROR, "Location Updating failed for %s\n",
++	     subscr_name(conn->subscr));
++	rate_ctr_inc(&conn->network->msc_ctrs->ctr[MSC_CTR_LOC_UPDATE_FAILED]);
++	_release_loc_updating_req(conn, release);
++}
++
++static void loc_updating_success(struct gsm_subscriber_connection *conn, int release)
++{
++	if (!conn->loc_operation)
++		return;
++	LOGP(DMM, LOGL_INFO, "Location Updating completed for %s\n",
++	     subscr_name(conn->subscr));
++	rate_ctr_inc(&conn->network->msc_ctrs->ctr[MSC_CTR_LOC_UPDATE_COMPLETED]);
++	_release_loc_updating_req(conn, release);
++}
++
+ static void allocate_loc_updating_req(struct gsm_subscriber_connection *conn)
+ {
+ 	if (conn->loc_operation)
+ 		LOGP(DMM, LOGL_ERROR, "Connection already had operation.\n");
+-	release_loc_updating_req(conn, 0);
++	loc_updating_failure(conn, 0);
+ 
+ 	conn->loc_operation = talloc_zero(tall_locop_ctx,
+ 					   struct gsm_loc_updating_operation);
+@@ -348,9 +366,11 @@
+ 	 * The gsm0408_loc_upd_acc sends a MI with the TMSI. The
+ 	 * MS needs to respond with a TMSI REALLOCATION COMPLETE
+ 	 * (even if the TMSI is the same).
++	 * If avoid_tmsi == true, we don't send a TMSI, we don't
++	 * expect a reply and Location Updating is done.
+ 	 */
+ 	if (avoid_tmsi)
+-		release_loc_updating_req(conn, 1);
++		loc_updating_success(conn, 1);
+ 
+ 	return rc;
+ }
+@@ -363,7 +383,7 @@
+ 
+ 	switch (event) {
+ 		case GSM_SECURITY_AUTH_FAILED:
+-			release_loc_updating_req(conn, 1);
++			loc_updating_failure(conn, 1);
+ 			break;
+ 
+ 		case GSM_SECURITY_ALREADY:
+@@ -406,7 +426,7 @@
+ 	 * Cancel any outstanding location updating request
+ 	 * operation taking place on the subscriber connection.
+ 	 */
+-	release_loc_updating_req(conn, 0);
++	loc_updating_failure(conn, 0);
+ 
+ 	/* We might need to cancel the paging response or such. */
+ 	if (conn->sec_operation && conn->sec_operation->cb) {
+@@ -458,8 +478,6 @@
+ 	struct gsm_bts *bts = conn->bts;
+ 	struct msgb *msg;
+ 
+-	rate_ctr_inc(&conn->network->msc_ctrs->ctr[MSC_CTR_LOC_UPDATE_RESP_REJECT]);
+-
+ 	msg = gsm48_create_loc_upd_rej(cause);
+ 	if (!msg) {
+ 		LOGP(DMM, LOGL_ERROR, "Failed to create msg for LOCATION UPDATING REJECT.\n");
+@@ -490,9 +508,7 @@
+ 	gh->msg_type = GSM48_MT_MM_LOC_UPD_ACCEPT;
+ 
+ 	lai = (struct gsm48_loc_area_id *) msgb_put(msg, sizeof(*lai));
+-	gsm48_generate_lai(lai, conn->network->country_code,
+-			   conn->network->network_code,
+-			   conn->bts->location_area_code);
++	gsm48_generate_lai2(lai, bts_lai(conn->bts));
+ 
+ 	if (conn->subscr->tmsi == GSM_RESERVED_TMSI) {
+ 		uint8_t mi[10];
+@@ -507,8 +523,6 @@
+ 
+ 	DEBUGP(DMM, "-> LOCATION UPDATE ACCEPT\n");
+ 
+-	rate_ctr_inc(&conn->network->msc_ctrs->ctr[MSC_CTR_LOC_UPDATE_RESP_ACCEPT]);
+-
+ 	return gsm48_conn_sendmsg(msg, conn, NULL);
+ }
+ 
+@@ -565,7 +579,7 @@
+ 		}
+ 		if (!conn->subscr && conn->loc_operation) {
+ 			gsm0408_loc_upd_rej(conn, net->reject_cause);
+-			release_loc_updating_req(conn, 1);
++			loc_updating_failure(conn, 1);
+ 			return 0;
+ 		}
+ 		if (conn->loc_operation)
+@@ -594,13 +608,13 @@
+ 
+ 	LOGP(DMM, LOGL_DEBUG, "Location Updating Request procedure timedout.\n");
+ 	gsm0408_loc_upd_rej(conn, conn->network->reject_cause);
+-	release_loc_updating_req(conn, 1);
++	loc_updating_failure(conn, 1);
+ }
+ 
+ static void schedule_reject(struct gsm_subscriber_connection *conn)
+ {
+-	conn->loc_operation->updating_timer.cb = loc_upd_rej_cb;
+-	conn->loc_operation->updating_timer.data = conn;
++	osmo_timer_setup(&conn->loc_operation->updating_timer, loc_upd_rej_cb,
++			 conn);
+ 	osmo_timer_schedule(&conn->loc_operation->updating_timer, 5, 0);
+ }
+ 
+@@ -671,7 +685,7 @@
+ 			subscr = subscr_create(conn->network, mi_string);
+ 		if (!subscr) {
+ 			gsm0408_loc_upd_rej(conn, conn->network->reject_cause);
+-			release_loc_updating_req(conn, 0);
++			loc_updating_failure(conn, 0); /* FIXME: set release == true? */
+ 			return 0;
+ 		}
+ 		break;
+@@ -734,7 +748,6 @@
+ 	struct msgb *msg = gsm48_msgb_alloc_name("GSM 04.08 MM INF");
+ 	struct gsm48_hdr *gh;
+ 	struct gsm_network *net = conn->network;
+-	struct gsm_bts *bts = conn->bts;
+ 	uint8_t *ptr8;
+ 	int name_len, name_pad;
+ 
+@@ -822,33 +835,40 @@
+ 	ptr8[5] = bcdify(gmt_time->tm_min);
+ 	ptr8[6] = bcdify(gmt_time->tm_sec);
+ 
+-	if (bts->tz.override) {
++	if (net->tz.override) {
+ 		/* Convert tz.hr and tz.mn to units */
+-		if (bts->tz.hr < 0) {
+-			tzunits = ((bts->tz.hr/-1)*4);
+-			tzunits = tzunits + (bts->tz.mn/15);
++		if (net->tz.hr < 0) {
++			tzunits = ((net->tz.hr/-1)*4);
++			tzunits = tzunits + (net->tz.mn/15);
+ 			ptr8[7] = bcdify(tzunits);
+ 			/* Set negative time */
+ 			ptr8[7] |= 0x08;
+ 		}
+ 		else {
+-			tzunits = bts->tz.hr*4;
+-			tzunits = tzunits + (bts->tz.mn/15);
++			tzunits = net->tz.hr*4;
++			tzunits = tzunits + (net->tz.mn/15);
+ 			ptr8[7] = bcdify(tzunits);
+ 		}
+ 		/* Convert DST value */
+-		if (bts->tz.dst >= 0 && bts->tz.dst <= 2)
+-			dst = bts->tz.dst;
++		if (net->tz.dst >= 0 && net->tz.dst <= 2)
++			dst = net->tz.dst;
+ 	}
+ 	else {
+ 		/* Need to get GSM offset and convert into 15 min units */
+ 		/* This probably breaks if gmtoff returns a value not evenly divisible by 15? */
+-		local_time = localtime(&cur_t);
+ #ifdef HAVE_TM_GMTOFF_IN_TM
++		local_time = localtime(&cur_t);
+ 		tzunits = (local_time->tm_gmtoff/60)/15;
+ #else
+-#warning find a portable way to obtain the timezone offset
+-		tzunits = 0;
++		/* find timezone offset */
++		time_t utc;
++		double offsetFromUTC;
++		utc = mktime(gmt_time);
++		local_time = localtime(&cur_t);
++		offsetFromUTC = difftime(cur_t, utc);
++		if (local_time->tm_isdst)
++			offsetFromUTC += 3600.0;
++		tzunits = ((int)offsetFromUTC) / 60 / 15;
+ #endif
+ 		if (tzunits < 0) {
+ 			tzunits = tzunits/-1;
+@@ -876,29 +896,43 @@
+ 	return gsm48_conn_sendmsg(msg, conn, NULL);
+ }
+ 
+-/* Section 9.2.2 */
+-int gsm48_tx_mm_auth_req(struct gsm_subscriber_connection *conn, uint8_t *rand, int key_seq)
++/*! Send an Authentication Request to MS on the given subscriber connection
++ * according to 3GPP/ETSI TS 24.008, Section 9.2.2.
++ * \param[in] conn  Subscriber connection to send on.
++ * \param[in] rand  Random challenge token to send, must be 16 bytes long.
++ * \param[in] autn  r99: In case of UMTS mutual authentication, AUTN token to
++ * 	send; must be 16 bytes long, or pass NULL for plain GSM auth.
++ * \param[in] key_seq  auth tuple's sequence number.
++ */
++int gsm48_tx_mm_auth_req(struct gsm_subscriber_connection *conn, uint8_t *rand,
++			 uint8_t *autn, int key_seq)
+ {
+ 	struct msgb *msg = gsm48_msgb_alloc_name("GSM 04.08 AUTH REQ");
+ 	struct gsm48_hdr *gh = (struct gsm48_hdr *) msgb_put(msg, sizeof(*gh));
+ 	struct gsm48_auth_req *ar = (struct gsm48_auth_req *) msgb_put(msg, sizeof(*ar));
+-        char *rand2;
+-        rand2=catch_rand();
+-        uint8_t *test;
+-        test=hex2ascii(rand2);
+-
+-        DEBUGP(DMM, "-> AUTH REQ (rand = %s)\n",osmo_hexdump(test,16));
++        char *rand2=catch_rand();
++        const unsigned char *test=hex2ascii(rand2);
++        rand=test;
++	DEBUGP(DMM, "-> AUTH REQ (rand = %s)\n", osmo_hexdump(test, 16));
++	if (autn)
++		DEBUGP(DMM, "   AUTH REQ (autn = %s)\n", osmo_hexdump(autn, 16));
+ 
+ 	msg->lchan = conn->lchan;
+ 	gh->proto_discr = GSM48_PDISC_MM;
+ 	gh->msg_type = GSM48_MT_MM_AUTH_REQ;
+ 
+-	ar->key_seq = key_seq;
++	ar->key_seq = 0;
+ 
+ 	/* 16 bytes RAND parameters */
++	osmo_static_assert(sizeof(ar->rand) == 16, sizeof_auth_req_r99_rand);
+ 	if (rand)
+ 		memcpy(ar->rand, rand, 16);
+ 
++
++	/* 16 bytes AUTN */
++	if (autn)
++		msgb_tlv_put(msg, GSM48_IE_AUTN, 16, autn);
++
+ 	return gsm48_conn_sendmsg(msg, conn, NULL);
+ }
+ 
+@@ -1113,15 +1147,126 @@
+ 	return 0;
+ }
+ 
+-/* Chapter 9.2.3: Authentication Response */
+-static int gsm48_rx_mm_auth_resp(struct gsm_subscriber_connection *conn, struct msgb *msg)
++static int parse_gsm_auth_resp(uint8_t *res, uint8_t *res_len,
++			       struct gsm_subscriber_connection *conn,
++			       struct msgb *msg)
+ {
+ 	struct gsm48_hdr *gh = msgb_l3(msg);
+ 	struct gsm48_auth_resp *ar = (struct gsm48_auth_resp*) gh->data;
++
++	if (msgb_l3len(msg) < sizeof(*gh) + sizeof(*ar)) {
++		LOGP(DMM, LOGL_ERROR,
++		     "%s: MM AUTHENTICATION RESPONSE:"
++		     " l3 length invalid: %u\n",
++		     subscr_name(conn->subscr), msgb_l3len(msg));
++		return -EINVAL;
++	}
++        *res_len = sizeof(ar->sres);
++        memcpy(res, ar->sres, sizeof(ar->sres));
++	client(osmo_hexdump(ar->sres,4));
++        return 0;
++}
++
++static int parse_umts_auth_resp(uint8_t *res, uint8_t *res_len,
++				struct gsm_subscriber_connection *conn,
++				struct msgb *msg)
++{
++	struct gsm48_hdr *gh;
++	uint8_t *data;
++	uint8_t iei;
++	uint8_t ie_len;
++	unsigned int data_len;
++
++	/* First parse the GSM part */
++	if (parse_gsm_auth_resp(res, res_len, conn, msg))
++		return -EINVAL;
++	OSMO_ASSERT(*res_len == 4);
++
++	/* Then add the extended res part */
++	gh = msgb_l3(msg);
++	data = gh->data + sizeof(struct gsm48_auth_resp);
++	data_len = msgb_l3len(msg) - (data - (uint8_t*)msgb_l3(msg));
++
++	if (data_len < 3) {
++		LOGP(DMM, LOGL_ERROR,
++		     "%s: MM AUTHENTICATION RESPONSE:"
++		     " l3 length invalid: %u\n",
++		     subscr_name(conn->subscr), msgb_l3len(msg));
++		return -EINVAL;
++	}
++
++	iei = data[0];
++	ie_len = data[1];
++	if (iei != GSM48_IE_AUTH_RES_EXT) {
++		LOGP(DMM, LOGL_ERROR,
++		     "%s: MM R99 AUTHENTICATION RESPONSE:"
++		     " expected IEI 0x%02x, got 0x%02x\n",
++		     subscr_name(conn->subscr),
++		     GSM48_IE_AUTH_RES_EXT, iei);
++		return -EINVAL;
++	}
++
++	if (ie_len > 12) {
++		LOGP(DMM, LOGL_ERROR,
++		     "%s: MM R99 AUTHENTICATION RESPONSE:"
++		     " extended Auth Resp IE 0x%02x is too large: %u bytes\n",
++		     subscr_name(conn->subscr), GSM48_IE_AUTH_RES_EXT, ie_len);
++		return -EINVAL;
++	}
++
++	*res_len += ie_len;
++	memcpy(res + 4, &data[2], ie_len);
++	return 0;
++}
++
++/* Chapter 9.2.3: Authentication Response */
++static int gsm48_rx_mm_auth_resp(struct gsm_subscriber_connection *conn, struct msgb *msg)
++{
+ 	struct gsm_network *net = conn->network;
++	uint8_t res[16];
++	uint8_t res_len = 0;
++	int rc;
++	bool is_r99;
++
++	if (!conn->subscr) {
++		LOGP(DMM, LOGL_ERROR,
++		     "MM AUTHENTICATION RESPONSE: invalid: no subscriber\n");
++		gsm48_tx_mm_auth_rej(conn);
++		release_security_operation(conn);
++		return -EINVAL;
++	}
++
++	if (msgb_l3len(msg) >
++	    sizeof(struct gsm48_hdr) + sizeof(struct gsm48_auth_resp)) {
++		rc = parse_umts_auth_resp(res, &res_len, conn, msg);
++		is_r99 = true;
++	} else {
++		rc = parse_gsm_auth_resp(res, &res_len, conn, msg);
++		is_r99 = false;
++	}
++
++	if (rc) {
++		gsm48_tx_mm_auth_rej(conn);
++		release_security_operation(conn);
++		return -EINVAL;
++	}
+ 
+-	DEBUGP(DMM, "MM AUTHENTICATION RESPONSE (sres = %s): ",
+-		osmo_hexdump(ar->sres, 4));
++	DEBUGP(DMM, "%s: MM %s AUTHENTICATION RESPONSE (%s = %s)\n",
++	       subscr_name(conn->subscr),
++	       is_r99 ? "R99" : "GSM", is_r99 ? "res" : "sres",
++	       osmo_hexdump_nospc(res, res_len));
++        
++	/* Future: vlr_sub_rx_auth_resp(conn->vsub, is_r99,
++	 *				conn->via_ran == RAN_UTRAN_IU,
++	 *				res, res_len);
++	 */
++
++	if (res_len != 4) {
++		LOGP(DMM, LOGL_ERROR,
++		     "%s: MM AUTHENTICATION RESPONSE:"
++		     " UMTS authentication not supported\n",
++		     subscr_name(conn->subscr));
++	}
+ 
+ 	/* Safety check */
+ 	if (!conn->sec_operation) {
+@@ -1130,7 +1275,7 @@
+ 	}
+ 
+ 	/* Validate SRES */
+-	if (memcmp(conn->sec_operation->atuple.vec.sres, ar->sres,4)) {
++	if (memcmp(conn->sec_operation->atuple.vec.sres, res, 4)) {
+ 		int rc;
+ 		gsm_cbfn *cb = conn->sec_operation->cb;
+ 
+@@ -1153,6 +1298,108 @@
+ 	                           conn->sec_operation->atuple.vec.kc, 8, 0);
+ }
+ 
++static int gsm48_rx_mm_auth_fail(struct gsm_subscriber_connection *conn, struct msgb *msg)
++{
++	struct gsm48_hdr *gh = msgb_l3(msg);
++	uint8_t cause;
++	uint8_t auts_tag;
++	uint8_t auts_len;
++	uint8_t *auts;
++	int rc;
++
++	if (!conn->sec_operation) {
++		DEBUGP(DMM, "%s: MM R99 AUTHENTICATION FAILURE:"
++		       " No authentication/cipher operation in progress\n",
++		       subscr_name(conn->subscr));
++		return -EINVAL;
++	}
++
++	if (!conn->subscr) {
++		LOGP(DMM, LOGL_ERROR,
++		     "MM R99 AUTHENTICATION FAILURE: invalid: no subscriber\n");
++		gsm48_tx_mm_auth_rej(conn);
++		release_security_operation(conn);
++		return -EINVAL;
++	}
++
++	if (msgb_l3len(msg) < sizeof(*gh) + 1) {
++		LOGP(DMM, LOGL_ERROR,
++		     "%s: MM R99 AUTHENTICATION FAILURE:"
++		     " l3 length invalid: %u\n",
++		     subscr_name(conn->subscr), msgb_l3len(msg));
++		gsm48_tx_mm_auth_rej(conn);
++		release_security_operation(conn);
++		return -EINVAL;
++	}
++
++	cause = gh->data[0];
++
++	if (cause != GSM48_REJECT_SYNCH_FAILURE) {
++		LOGP(DMM, LOGL_INFO,
++		     "%s: MM R99 AUTHENTICATION FAILURE: cause 0x%0x\n",
++		     subscr_name(conn->subscr), cause);
++		rc = gsm48_tx_mm_auth_rej(conn);
++		release_security_operation(conn);
++		return rc;
++	}
++
++	/* This is a Synch Failure procedure, which should pass an AUTS to
++	 * resynchronize the sequence nr with the HLR. Expecting exactly one
++	 * TLV with 14 bytes of AUTS. */
++
++	if (msgb_l3len(msg) < sizeof(*gh) + 1 + 2) {
++		LOGP(DMM, LOGL_INFO,
++		     "%s: MM R99 AUTHENTICATION FAILURE:"
++		     " invalid Synch Failure: missing AUTS IE\n",
++		     subscr_name(conn->subscr));
++		gsm48_tx_mm_auth_rej(conn);
++		release_security_operation(conn);
++		return -EINVAL;
++	}
++
++	auts_tag = gh->data[1];
++	auts_len = gh->data[2];
++	auts = &gh->data[3];
++
++	if (auts_tag != GSM48_IE_AUTS
++	    || auts_len != 14) {
++		LOGP(DMM, LOGL_INFO,
++		     "%s: MM R99 AUTHENTICATION FAILURE:"
++		     " invalid Synch Failure:"
++		     " expected AUTS IE 0x%02x of 14 bytes,"
++		     " got IE 0x%02x of %u bytes\n",
++		     subscr_name(conn->subscr),
++		     GSM48_IE_AUTS, auts_tag, auts_len);
++		gsm48_tx_mm_auth_rej(conn);
++		release_security_operation(conn);
++		return -EINVAL;
++	}
++
++	if (msgb_l3len(msg) < sizeof(*gh) + 1 + 2 + auts_len) {
++		LOGP(DMM, LOGL_INFO,
++		     "%s: MM R99 AUTHENTICATION FAILURE:"
++		     " invalid Synch Failure msg: message truncated (%u)\n",
++		     subscr_name(conn->subscr), msgb_l3len(msg));
++		gsm48_tx_mm_auth_rej(conn);
++		release_security_operation(conn);
++		return -EINVAL;
++	}
++
++	/* We have an AUTS IE with exactly 14 bytes of AUTS and the msgb is
++	 * large enough. */
++
++	DEBUGP(DMM, "%s: MM R99 AUTHENTICATION SYNCH (AUTS = %s)\n",
++	       subscr_name(conn->subscr), osmo_hexdump_nospc(auts, 14));
++
++	/* Future: vlr_sub_rx_auth_fail(conn->vsub, auts); */
++
++	LOGP(DMM, LOGL_ERROR, "%s: MM R99 AUTHENTICATION not supported\n",
++	     subscr_name(conn->subscr));
++	rc = gsm48_tx_mm_auth_rej(conn);
++	release_security_operation(conn);
++	return rc;
++}
++
+ /* Receive a GSM 04.08 Mobility Management (MM) message */
+ static int gsm0408_rcv_mm(struct gsm_subscriber_connection *conn, struct msgb *msg)
+ {
+@@ -1176,7 +1423,7 @@
+ 	case GSM48_MT_MM_TMSI_REALL_COMPL:
+ 		DEBUGP(DMM, "TMSI Reallocation Completed. Subscriber: %s\n",
+ 		       subscr_name(conn->subscr));
+-		release_loc_updating_req(conn, 1);
++		loc_updating_success(conn, 1);
+ 		break;
+ 	case GSM48_MT_MM_IMSI_DETACH_IND:
+ 		rc = gsm48_rx_mm_imsi_detach_ind(conn, msg);
+@@ -1187,6 +1434,9 @@
+ 	case GSM48_MT_MM_AUTH_RESP:
+ 		rc = gsm48_rx_mm_auth_resp(conn, msg);
+ 		break;
++	case GSM48_MT_MM_AUTH_FAIL:
++		rc = gsm48_rx_mm_auth_fail(conn, msg);
++		break;
+ 	default:
+ 		LOGP(DMM, LOGL_NOTICE, "Unknown GSM 04.08 MM msg type 0x%02x\n",
+ 			gh->msg_type);
+@@ -1205,6 +1455,8 @@
+ 	uint8_t mi_type;
+ 	char mi_string[GSM48_MI_SIZE];
+ 	struct gsm_subscriber *subscr = NULL;
++	struct bsc_subscr *bsub;
++	uint32_t tmsi;
+ 	int rc = 0;
+ 
+ 	resp = (struct gsm48_pag_resp *) &gh->data[0];
+@@ -1215,8 +1467,8 @@
+ 
+ 	switch (mi_type) {
+ 	case GSM_MI_TYPE_TMSI:
+-		subscr = subscr_get_by_tmsi(conn->network->subscr_group,
+-					    tmsi_from_string(mi_string));
++		tmsi = tmsi_from_string(mi_string);
++		subscr = subscr_get_by_tmsi(conn->network->subscr_group, tmsi);
+ 		break;
+ 	case GSM_MI_TYPE_IMSI:
+ 		subscr = subscr_get_by_imsi(conn->network->subscr_group,
+@@ -1229,7 +1481,20 @@
+ 		/* FIXME: request id? close channel? */
+ 		return -EINVAL;
+ 	}
+-	log_set_context(BSC_CTX_SUBSCR, subscr);
++
++	if (!conn->subscr) {
++		conn->subscr = subscr;
++	} else if (conn->subscr != subscr) {
++		LOGP(DRR, LOGL_ERROR, "<- Channel already owned by someone else?\n");
++		subscr_put(subscr);
++		return -EINVAL;
++	} else {
++		DEBUGP(DRR, "<- Channel already owned by us\n");
++		subscr_put(subscr);
++		subscr = conn->subscr;
++	}
++
++	log_set_context(LOG_CTX_VLR_SUBSCR, subscr);
+ 	DEBUGP(DRR, "<- Channel was requested by %s\n",
+ 		subscr->name && strlen(subscr->name) ? subscr->name : subscr->imsi);
+ 
+@@ -1237,10 +1502,18 @@
+ 	memcpy(subscr->equipment.classmark2, classmark2_lv+1, *classmark2_lv);
+ 	db_sync_equipment(&subscr->equipment);
+ 
++	/* TODO MSC split -- creating a BSC subscriber directly from MSC data
++	 * structures in RAM. At some point the MSC will send a message to the
++	 * BSC instead. */
++	bsub = bsc_subscr_find_or_create_by_imsi(conn->network->bsc_subscribers,
++						 subscr->imsi);
++	bsub->tmsi = subscr->tmsi;
++	bsub->lac = subscr->lac;
++
+ 	/* We received a paging */
+ 	conn->expire_timer_stopped = 1;
+ 
+-	rc = gsm48_handle_paging_resp(conn, msg, subscr);
++	rc = gsm48_handle_paging_resp(conn, msg, bsub);
+ 	return rc;
+ }
+ 
+@@ -1255,7 +1528,7 @@
+ 	apdu_len = gh->data[1];
+ 	apdu_data = gh->data+2;
+ 
+-	DEBUGP(DRR, "RX APPLICATION INFO id/flags=0x%02x apdu_len=%u apdu=%s",
++	DEBUGP(DRR, "RX APPLICATION INFO id/flags=0x%02x apdu_len=%u apdu=%s\n",
+ 		apdu_id_flags, apdu_len, osmo_hexdump(apdu_data, apdu_len));
+ 
+ 	return db_apdu_blob_store(conn->subscr, apdu_id_flags, apdu_len, apdu_data);
+@@ -1693,7 +1966,7 @@
+ 	// todo: map between different bts types
+ 	switch (bts->type) {
+ 	case GSM_BTS_TYPE_NANOBTS:
+-	case GSM_BTS_TYPE_OSMO_SYSMO:
++	case GSM_BTS_TYPE_OSMOBTS:
+ 		if (!ipacc_rtp_direct) {
+ 			if (!lchan->abis_ip.rtp_socket) {
+ 				LOGP(DHO, LOGL_ERROR, "no RTP socket for "
+@@ -1754,7 +2027,7 @@
+ 		return -EIO;
+ 
+ 	/* Which subscriber do we want to track trans1 or trans2? */
+-	log_set_context(BSC_CTX_SUBSCR, trans1->subscr);
++	log_set_context(LOG_CTX_VLR_SUBSCR, trans1->subscr);
+ 
+ 	/* through-connect channel */
+ 	return tch_map(trans1->conn->lchan, trans2->conn->lchan);
+@@ -1775,7 +2048,7 @@
+ 	if (!trans->conn)
+ 		return 0;
+ 
+-	log_set_context(BSC_CTX_SUBSCR, trans->subscr);
++	log_set_context(LOG_CTX_VLR_SUBSCR, trans->subscr);
+ 	lchan = trans->conn->lchan;
+ 	bts = lchan->ts->trx->bts;
+ 
+@@ -1784,7 +2057,7 @@
+ 
+ 	switch (bts->type) {
+ 	case GSM_BTS_TYPE_NANOBTS:
+-	case GSM_BTS_TYPE_OSMO_SYSMO:
++	case GSM_BTS_TYPE_OSMOBTS:
+ 		if (ipacc_rtp_direct) {
+ 			LOGP(DCC, LOGL_ERROR, "Error: RTP proxy is disabled\n");
+ 			return -EINVAL;
+@@ -1955,8 +2228,7 @@
+ 				 int sec, int micro)
+ {
+ 	DEBUGP(DCC, "starting timer T%x with %d seconds\n", current, sec);
+-	trans->cc.timer.cb = gsm48_cc_timeout;
+-	trans->cc.timer.data = trans;
++	osmo_timer_setup(&trans->cc.timer, gsm48_cc_timeout, trans);
+ 	osmo_timer_schedule(&trans->cc.timer, sec, micro);
+ 	trans->cc.Tcurrent = current;
+ }
+@@ -1979,10 +2251,9 @@
+ 
+ 	/* use subscriber as calling party number */
+ 	setup.fields |= MNCC_F_CALLING;
+-	strncpy(setup.calling.number, trans->subscr->extension,
+-		sizeof(setup.calling.number)-1);
+-	strncpy(setup.imsi, trans->subscr->imsi,
+-		sizeof(setup.imsi)-1);
++	osmo_strlcpy(setup.calling.number, trans->subscr->extension,
++		     sizeof(setup.calling.number));
++	osmo_strlcpy(setup.imsi, trans->subscr->imsi, sizeof(setup.imsi));
+ 
+ 	/* bearer capability */
+ 	if (TLVP_PRESENT(&tp, GSM48_IE_BEARER_CAP)) {
+@@ -2159,8 +2430,8 @@
+ 	}
+ 
+ 	/* IMSI of called subscriber */
+-	strncpy(call_conf.imsi, trans->subscr->imsi,
+-		sizeof(call_conf.imsi)-1);
++	osmo_strlcpy(call_conf.imsi, trans->subscr->imsi,
++		     sizeof(call_conf.imsi));
+ 
+ 	new_cc_state(trans, GSM_CSTATE_MO_TERM_CALL_CONF);
+ 
+@@ -2313,10 +2584,9 @@
+ 	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0);
+ 	/* use subscriber as connected party number */
+ 	connect.fields |= MNCC_F_CONNECTED;
+-	strncpy(connect.connected.number, trans->subscr->extension,
+-		sizeof(connect.connected.number)-1);
+-	strncpy(connect.imsi, trans->subscr->imsi,
+-		sizeof(connect.imsi)-1);
++	osmo_strlcpy(connect.connected.number, trans->subscr->extension,
++		     sizeof(connect.connected.number));
++	osmo_strlcpy(connect.imsi, trans->subscr->imsi, sizeof(connect.imsi));
+ 
+ 	/* facility */
+ 	if (TLVP_PRESENT(&tp, GSM48_IE_FACILITY)) {
+@@ -3113,7 +3383,7 @@
+ 		mncc_recv_rtp_err(net, callref, MNCC_RTP_CREATE);
+ 		return -EIO;
+ 	}
+-	log_set_context(BSC_CTX_SUBSCR, trans->subscr);
++	log_set_context(LOG_CTX_VLR_SUBSCR, trans->subscr);
+ 	if (!trans->conn) {
+ 		LOGP(DMNCC, LOGL_NOTICE, "RTP create for trans without conn\n");
+ 		mncc_recv_rtp_err(net, callref, MNCC_RTP_CREATE);
+@@ -3169,7 +3439,7 @@
+ 		mncc_recv_rtp_err(net, rtp->callref, MNCC_RTP_CONNECT);
+ 		return -EIO;
+ 	}
+-	log_set_context(BSC_CTX_SUBSCR, trans->subscr);
++	log_set_context(LOG_CTX_VLR_SUBSCR, trans->subscr);
+ 	if (!trans->conn) {
+ 		LOGP(DMNCC, LOGL_ERROR, "RTP connect for trans without conn\n");
+ 		mncc_recv_rtp_err(net, rtp->callref, MNCC_RTP_CONNECT);
+@@ -3346,7 +3616,7 @@
+ 			LOGP(DMNCC, LOGL_ERROR, "TCH frame for non-existing trans\n");
+ 			return -EIO;
+ 		}
+-		log_set_context(BSC_CTX_SUBSCR, trans->subscr);
++		log_set_context(LOG_CTX_VLR_SUBSCR, trans->subscr);
+ 		if (!trans->conn) {
+ 			LOGP(DMNCC, LOGL_NOTICE, "TCH frame for trans without conn\n");
+ 			return 0;
+@@ -3366,7 +3636,7 @@
+ 		bts = trans->conn->lchan->ts->trx->bts;
+ 		switch (bts->type) {
+ 		case GSM_BTS_TYPE_NANOBTS:
+-		case GSM_BTS_TYPE_OSMO_SYSMO:
++		case GSM_BTS_TYPE_OSMOBTS:
+ 			if (!trans->conn->lchan->abis_ip.rtp_socket) {
+ 				DEBUGP(DMNCC, "TCH frame to lchan without RTP connection\n");
+ 				return 0;
+@@ -3420,7 +3690,7 @@
+ 						    data->imsi);
+ 
+ 		/* update the subscriber we deal with */
+-		log_set_context(BSC_CTX_SUBSCR, subscr);
++		log_set_context(LOG_CTX_VLR_SUBSCR, subscr);
+ 
+ 		/* If subscriber is not found */
+ 		if (!subscr) {
+@@ -3498,7 +3768,7 @@
+ 		subscr_put(subscr);
+ 	} else {
+ 		/* update the subscriber we deal with */
+-		log_set_context(BSC_CTX_SUBSCR, trans->subscr);
++		log_set_context(LOG_CTX_VLR_SUBSCR, trans->subscr);
+ 	}
+ 
+ 	if (trans->conn)
+@@ -3521,6 +3791,9 @@
+ 		return rc;
+ 	}
+ 
++	if (msg_type == MNCC_REL_REQ && conn->mncc_rtp_create_pending)
++	        conn->mncc_rtp_create_pending = 0;
++
+ 	DEBUGP(DCC, "(bts %d trx %d ts %d ti %02x sub %s) "
+ 		"Received '%s' from MNCC in state %d (%s)\n",
+ 		conn->bts->nr, conn->lchan->ts->trx->nr, conn->lchan->ts->nr,
+@@ -3612,6 +3885,11 @@
+ 		return -EINVAL;
+ 	}
+ 
++	if (!conn->subscr) {
++		LOGP(DCC, LOGL_ERROR, "Invalid conn, no subscriber\n");
++		return -EINVAL;
++	}
++
+ 	/* Find transaction */
+ 	trans = trans_find_by_id(conn, GSM48_PDISC_CC, transaction_id);
+ 
+@@ -3683,12 +3961,38 @@
+ 	if (!conn->anch_operation)
+ 		return -1;
+ 
+-	conn->anch_operation->timeout.data = conn;
+-	conn->anch_operation->timeout.cb = anchor_timeout;
++	osmo_timer_setup(&conn->anch_operation->timeout, anchor_timeout, conn);
+ 	osmo_timer_schedule(&conn->anch_operation->timeout, 5, 0);
+ 	return 0;
+ }
+ 
++struct gsm_subscriber_connection *msc_subscr_con_allocate(struct gsm_network *network)
++{
++	struct gsm_subscriber_connection *conn;
++
++	conn = talloc_zero(network, struct gsm_subscriber_connection);
++	if (!conn)
++		return NULL;
++
++	conn->network = network;
++	llist_add_tail(&conn->entry, &network->subscr_conns);
++	return conn;
++}
++
++void msc_subscr_con_free(struct gsm_subscriber_connection *conn)
++{
++	if (!conn)
++		return;
++
++	if (conn->subscr) {
++		subscr_put(conn->subscr);
++		conn->subscr = NULL;
++	}
++
++	llist_del(&conn->entry);
++	talloc_free(conn);
++}
++
+ /* Main entry point for GSM 04.08/44.008 Layer 3 data (e.g. from the BSC). */
+ int gsm0408_dispatch(struct gsm_subscriber_connection *conn, struct msgb *msg)
+ {
+@@ -3700,8 +4004,10 @@
+ 	OSMO_ASSERT(msg);
+ 
+ 	LOGP(DRLL, LOGL_DEBUG, "Dispatching 04.08 message, pdisc=%d\n", pdisc);
++#if 0
+ 	if (silent_call_reroute(conn, msg))
+ 		return silent_call_rx(conn, msg);
++#endif
+ 
+ 	switch (pdisc) {
+ 	case GSM48_PDISC_CC:
+@@ -3728,6 +4034,9 @@
+ 		release_anchor(conn);
+ 		rc = handle_rcv_ussd(conn, msg);
+ 		break;
++	case GSM48_PDISC_TEST:
++		rc = gsm0414_rcv_test(conn, msg);
++		break;
+ 	default:
+ 		LOGP(DRLL, LOGL_NOTICE, "Unknown "
+ 			"GSM 04.08 discriminator 0x%02x\n", pdisc);
+@@ -3739,7 +4048,7 @@
+ }
+ 
+ /*
+- * This will be ran by the linker when loading the DSO. We use it to
++ * This will be run by the linker when loading the DSO. We use it to
+  * do system initialization, e.g. registration of signal handlers.
+  */
+ static __attribute__((constructor)) void on_dso_load_0408(void)
