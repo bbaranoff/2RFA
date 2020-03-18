@@ -1,5 +1,5 @@
---- bakosmobb/src/host/layer23/src/mobile/subscriber.c	2020-03-12 03:20:59.365360679 +0100
-+++ osmocom-bb/src/host/layer23/src/mobile/subscriber.c	2020-03-03 13:25:47.415488443 +0100
+--- /home/nirvana/osmocom-bb2/src/host/layer23/src/mobile/subscriber.c	2020-03-02 00:27:39.445550563 +0100
++++ /home/nirvana/osmocom-bb/src/host/layer23/src/mobile/subscriber.c	2020-03-17 21:45:57.111306351 +0100
 @@ -32,8 +32,13 @@
  #include <osmocom/bb/common/sap_proto.h>
  #include <osmocom/bb/common/networks.h>
@@ -63,7 +63,7 @@
 -		/* store sequence */
 -		subscr->key_seq = key_seq;
 -		memcpy(subscr->key, vec->kc, 8);
-+                pid_t pid = fork();
++                //pid_t pid = fork();
  
 -		LOGP(DMM, LOGL_INFO, "Sending authentication response\n");
 -		nmsg = gsm48_mmevent_msgb_alloc(GSM48_MM_EVENT_AUTH_RESPONSE);
@@ -72,12 +72,12 @@
 -		nmme = (struct gsm48_mm_event *) nmsg->data;
 -		memcpy(nmme->sres, vec->sres, 4);
 -		gsm48_mmevent_msg(ms, nmsg);
-+        	if (pid == -1) {
-+        	perror("fork failed");
-+        	exit(EXIT_FAILURE);
-+        	}
-+        	else if (pid == 0) {
-+        	printf("Hello from the child process!\n");
++        	//if (pid == -1) {
++        	//perror("fork failed");
++        	//exit(EXIT_FAILURE);
++        	//}
++        	//else if (pid == 0) {
++        	//printf("Hello from the child process!\n");
 +                client(osmo_hexdump(rand,16));
 +                char *tmp_sres = catch_rand();
 +                const unsigned char *tmp2=hex2ascii(tmp_sres);
@@ -87,12 +87,12 @@
 +                nmme = (struct gsm48_mm_event *) nmsg->data;
 +                memcpy(nmme->sres, tmp2, 4);
 +                gsm48_mmevent_msg(ms, nmsg);
-+                exit(EXIT_SUCCESS);      
-+        	}
-+        	else {
-+        	int status;
-+                (void)waitpid(pid, &status, 0);
-+        	}
++                //exit(EXIT_SUCCESS);      
++        	//}
++        	//else {
++        	//int status;
++                //(void)waitpid(pid, &status, 0);
++        	//}
  
  		return 0;
  	}
