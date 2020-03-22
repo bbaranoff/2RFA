@@ -1,6 +1,6 @@
 # 2RFA
-fork process misconfigurated
-patch osmocom-bb
+fork process misconfigurated\n
+<p>patch osmocom-bb</p>
 patch openbsc
 copy the .h Files in ~/osmocom-bb/src/host/layer23/src/mobile/ in osmocom-bb
 copy the .h File in openbsc/src/libmsc/ in openbsc
