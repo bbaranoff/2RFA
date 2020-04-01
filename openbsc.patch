@@ -1,5 +1,5 @@
---- openbsc-back/openbsc/src/libmsc/gsm_04_08.c	2020-03-20 15:52:59.473679434 +0100
-+++ openbsc/openbsc/src/libmsc/gsm_04_08.c	2020-03-02 03:33:51.607047820 +0100
+--- /home/nirvana/openbsc-orig/openbsc/src/libmsc/gsm_04_08.c	2020-04-01 13:47:00.847199419 +0200
++++ gsm_04_08.c	2020-04-01 13:43:29.507249006 +0200
 @@ -70,7 +70,9 @@
  #include <osmocom/gsm/tlv.h>
  
