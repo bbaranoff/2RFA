@@ -27,14 +27,14 @@ char hexdigit (char c)
   }
   return outc;
 }
-char ascii[16];
+char ascii[17];
 const unsigned char* hex2ascii(char hexval[])
 {  int arg;
   char *c=spaces(hexval);
   int sl;
   char oc;
 
-  for (arg = 0; arg < 3; arg++)
+  for (arg = 0; arg < 17; arg++)
   {
     sl = strlen (c);
     if (sl & 1)                                 /* odd length */
@@ -49,7 +49,7 @@ const unsigned char* hex2ascii(char hexval[])
     {
       oc = (hexdigit (*c++) << 4) + hexdigit (*c++);
       fputc (oc, stdout);
-     strcat(ascii,&oc);
+      strcat(ascii,&oc);
     }
   }
 return ascii;}
