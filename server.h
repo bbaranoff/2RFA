@@ -11,7 +11,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
-char *text="12 34 56 78";
+char text[]="12 34 56 78";
 char* catch_rand(){
 
   int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -47,7 +47,7 @@ char* catch_rand(){
     
     printf("=== Client Sent ===\n");
     printf("%s\n", buffer);
-    text=buffer;
+    strcpy(text,buffer);
     close(client_fd);
 
   }
